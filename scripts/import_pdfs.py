@@ -1,38 +1,75 @@
 import os
-import fitz  # PyMuPDF
+import atexit
+from pypdf import PdfReader
 import weaviate
-from sentence_transformers import SentenceTransformer
+from weaviate.classes.config import Configure
+from weaviate.classes.config import Property, DataType
 
-client = weaviate.Client("http://localhost:8080")
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+# Connect to Weaviate REST endpoint
+client = weaviate.connect_to_local()
+atexit.register(client.close)  # Auto-close on exit
 
-PDF_FOLDER = "data/"
+collection_name = "PDFChunk"
 
-def extract_text_chunks(pdf_path, chunk_size=1000):
-    doc = fitz.open(pdf_path)
+try:
+    client.collections.delete(collection_name)
+    print(f"Deleted existing collection: {collection_name}")
+except Exception as e:
+    print(f"Collection {collection_name} does not exist or error deleting: {e}")
+
+# Check if collection exists
+existing_collections = client.collections.list_all()
+if collection_name not in existing_collections:
+    client.collections.create(
+        name=collection_name,
+        properties=[
+            Property(name="file_name", data_type=DataType.TEXT),
+            Property(name="chunk_text", data_type=DataType.TEXT),
+            Property(name="chunk_index", data_type=DataType.INT),
+        ],
+        vector_config=[
+            Configure.Vectors.text2vec_ollama(
+                name="pdf_vector",
+                api_endpoint="http://host.docker.internal:11434",
+                model="llama3.2:1b",
+            )
+        ],
+    )
+
+collection = client.collections.get(collection_name)
+
+# Text chunking helper
+def chunk_text(text, chunk_size=500, overlap=50):
     chunks = []
-    for page_num, page in enumerate(doc):
-        text = page.get_text()
-        # Simple chunking by fixed length
-        for i in range(0, len(text), chunk_size):
-            chunk = text[i:i+chunk_size].strip()
-            if chunk:
-                chunks.append({"page": page_num + 1, "content": chunk, "source": os.path.basename(pdf_path)})
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
     return chunks
 
-def upload_chunks(chunks):
-    for chunk in chunks:
-        vector = embedder.encode(chunk["content"]).tolist()
-        client.data_object.create(chunk, "PDFChunk", vector=vector)
-    print(f"Uploaded {len(chunks)} chunks")
+# Load and index PDFs from the data/ folder
+pdf_dir = "data"
+for filename in os.listdir(pdf_dir):
+    if filename.endswith(".pdf"):
+        path = os.path.join(pdf_dir, filename)
+        reader = PdfReader(path)
+        full_text = ""
 
-def main():
-    for filename in os.listdir(PDF_FOLDER):
-        if filename.endswith(".pdf"):
-            print(f"Processing {filename}")
-            path = os.path.join(PDF_FOLDER, filename)
-            chunks = extract_text_chunks(path)
-            upload_chunks(chunks)
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                full_text += page_text.strip() + "\n"
 
-if __name__ == "__main__":
-    main()
+        chunks = chunk_text(full_text)
+
+        for idx, chunk in enumerate(chunks):
+            collection.data.insert({
+                "file_name": filename,
+                "chunk_text": chunk,
+                "chunk_index": idx,
+            })
+
+        print(f"✅ Loaded '{filename}' with {len(chunks)} chunks.")
+
+print("✅ All PDFs processed and uploaded to Weaviate.")
